@@ -1,0 +1,199 @@
+# Context Configuration
+# Asset, user, and business context for incident scoring
+
+# Default settings
+defaults:
+  asset_criticality: "medium"
+  user_privilege: "standard"
+
+# Asset criticality database
+assets:
+  # Example: Domain controllers
+  dc01:
+    criticality: "critical"
+    business_unit: "it_infrastructure"
+    data_classification: "restricted"
+    description: "Primary Domain Controller"
+  
+  dc02:
+    criticality: "critical"
+    business_unit: "it_infrastructure"
+    data_classification: "restricted"
+    description: "Secondary Domain Controller"
+  
+  # Example: Database servers
+  db-finance:
+    criticality: "critical"
+    business_unit: "finance"
+    data_classification: "confidential"
+    description: "Financial Database Server"
+  
+  db-hr:
+    criticality: "high"
+    business_unit: "hr"
+    data_classification: "confidential"
+    description: "HR Database Server"
+  
+  # Example: Web servers
+  web01:
+    criticality: "high"
+    business_unit: "operations"
+    data_classification: "public"
+    description: "Public Web Server"
+
+# IP range context
+ip_ranges:
+  "192.168.1.":  # Domain controllers
+    criticality: "critical"
+    business_unit: "it_infrastructure"
+    data_classification: "restricted"
+  
+  "192.168.10.":  # Finance network
+    criticality: "high"
+    business_unit: "finance"
+    data_classification: "confidential"
+  
+  "192.168.20.":  # HR network
+    criticality: "high"
+    business_unit: "hr"
+    data_classification: "confidential"
+  
+  "192.168.50.":  # General workstations
+    criticality: "medium"
+    business_unit: "operations"
+    data_classification: "internal"
+
+# User privilege database
+users:
+  # Administrators
+  admin:
+    privilege_level: "domain_admin"
+    department: "it_security"
+    is_privileged: true
+  
+  administrator:
+    privilege_level: "domain_admin"
+    department: "it_infrastructure"
+    is_privileged: true
+  
+  # Service accounts
+  svc_backup:
+    privilege_level: "service_account"
+    department: "it_operations"
+    is_privileged: true
+  
+  svc_sql:
+    privilege_level: "service_account"
+    department: "it_database"
+    is_privileged: true
+  
+  # Executives
+  ceo:
+    privilege_level: "executive"
+    department: "executive"
+    is_privileged: true
+  
+  cfo:
+    privilege_level: "executive"
+    department: "finance"
+    is_privileged: true
+  
+  # Standard users
+  john.doe:
+    privilege_level: "standard"
+    department: "sales"
+    is_privileged: false
+  
+  jane.smith:
+    privilege_level: "standard"
+    department: "marketing"
+    is_privileged: false
+
+# Business impact matrix
+impact_matrix:
+  # Category -> Criticality -> Base Impact Score (0-100 scale)
+  threat_intelligence:
+    critical: 90
+    high: 75
+    medium: 60
+    low: 45
+
+  authentication:
+    critical: 80
+    high: 65
+    medium: 55
+    low: 40
+
+  lateral_movement:
+    critical: 95
+    high: 80
+    medium: 70
+    low: 55
+
+  data_exfiltration:
+    critical: 100
+    high: 90
+    medium: 75
+    low: 60
+
+  reconnaissance:
+    critical: 60
+    high: 50
+    medium: 40
+    low: 25
+
+  account_compromise:
+    critical: 100
+    high: 85
+    medium: 70
+    low: 50
+
+  high_risk:
+    critical: 85
+    high: 75
+    medium: 60
+    low: 45
+
+  anomaly:
+    critical: 70
+    high: 55
+    medium: 40
+    low: 25
+
+  policy_violation:
+    critical: 65
+    high: 50
+    medium: 35
+    low: 20
+
+  compliance:
+    critical: 70
+    high: 55
+    medium: 40
+    low: 25
+
+# SLA configuration
+sla_definitions:
+  P1:
+    response_minutes: 15
+    resolution_hours: 4
+    escalation: "immediate"
+  
+  P2:
+    response_minutes: 60
+    resolution_hours: 24
+    escalation: "within_1_hour"
+  
+  P3:
+    response_minutes: 240
+    resolution_hours: 72
+    escalation: "within_4_hours"
+  
+  P4:
+    response_minutes: 1440
+    resolution_hours: 168
+    escalation: "next_business_day"
+
+metadata:
+  version: "1.0"
+  last_updated: "2026-02-06"

@@ -1,0 +1,652 @@
+# Correlation Rules Configuration
+# Event correlation rules for security detection
+#
+# Design principles:
+#   - Rules are source-agnostic: they match on enrichment fields computed
+#     uniformly for all Wazuh sources, not on specific rule IDs
+#   - Enrichment data (enrich.*) drives all decisions — blocked/denied
+#     traffic is filtered out of exfiltration rules
+#   - Info-level events (Wazuh level 0-4) are excluded upstream by L2
+#     risk scoring; only level 5+ events accumulate meaningful counters
+#   - Not every alert needs a correlated incident — the trigger-point
+#     model groups alerts per source IP only when rules match
+#   - No static false_positive_rate labels
+
+rules:
+  # ============================================================================
+  # Category 1: Authentication Attacks
+  #
+  # Catches: SSH (5712/5720), PAM (5551), FortiGate (81607/81615),
+  #   Windows (18106/18116), Cisco PIX/ASA (4321/64007), VPN (14251),
+  #   OpenVPN (81805/81806), AWS (80255), Web CMS (31510), O365
+  # ============================================================================
+
+  - id: AUTH-001
+    name: Brute Force Attack - Single Source
+    type: single
+    category: authentication
+    severity: high
+    description: >
+      Multiple failed authentication attempts from a single source IP within
+      5 minutes. Fires across all auth sources (SSH, VPN, Windows RDP,
+      FortiGate, Cisco, AWS, web apps) because the enricher normalizes
+      auth events and failure counters uniformly.
+    enabled: true
+    mitre_tactics:
+      - TA0006  # Credential Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: denied
+        - enrich.behavioral.recent_failures_5m:
+            gte: 10
+    response:
+      - Block source IP temporarily (15-30 minutes)
+      - Review authentication logs for targeted accounts
+      - Check GeoIP origin and IP reputation in enrichment data
+      - Consider implementing rate limiting on auth endpoints
+
+  - id: AUTH-002
+    name: Distributed Brute Force Attack
+    type: aggregation
+    category: authentication
+    severity: critical
+    description: >
+      Multiple source IPs failing authentication against the same account
+      within 10 minutes. Detects credential stuffing that Wazuh single-host
+      rules miss — requires cross-source correlation across SSH, Windows,
+      FortiGate, Cisco, AWS, and VPN auth failures.
+    enabled: true
+    time_window: 600  # 10 minutes
+    mitre_tactics:
+      - TA0006  # Credential Access
+    group_by:
+      - subject.name
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: denied
+    threshold:
+      count:
+        gte: 5
+        unique_field: subject.ip
+    response:
+      - Lock target account immediately
+      - Block all attacking source IPs at perimeter
+      - Force password reset on targeted account
+      - Investigate for credential stuffing campaign
+
+  - id: AUTH-003
+    name: Successful Login After Failed Attempts
+    type: single
+    category: authentication
+    severity: critical
+    description: >
+      Successful authentication following 5+ recent failures from the same
+      source. Strong indicator of successful brute force. Cross-source:
+      SSH failures followed by Windows success from same IP are caught.
+      Wazuh rule 40112 covers single-source; this adds GeoIP context.
+    enabled: true
+    mitre_tactics:
+      - TA0006  # Credential Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.behavioral.recent_failures_5m:
+            gte: 5
+    response:
+      - Assume account compromise — force logout all sessions
+      - Require immediate password reset and MFA enrollment
+      - Compare GeoIP of success vs failure locations
+      - Review all activity after the successful login
+
+  - id: AUTH-004
+    name: Account Enumeration
+    type: aggregation
+    category: authentication
+    severity: high
+    description: >
+      Same source IP failing authentication against 5+ different accounts
+      within 10 minutes. Detects credential stuffing across accounts —
+      attacker tries common passwords against many usernames. Distinct
+      from AUTH-001 (volume against one account) and AUTH-002 (many IPs
+      against one account).
+    enabled: true
+    time_window: 600  # 10 minutes
+    mitre_tactics:
+      - TA0006  # Credential Access
+    group_by:
+      - subject.ip
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: denied
+    threshold:
+      count:
+        gte: 5
+        unique_field: subject.name
+    response:
+      - Block source IP at perimeter immediately
+      - Investigate for credential stuffing campaign
+      - Check if targeted accounts share common attributes
+      - Review all accounts for successful login from same source
+
+  - id: AUTH-005
+    name: After-Hours External Authentication
+    type: single
+    category: authentication
+    severity: high
+    description: >
+      Successful authentication from an external (public) IP during
+      after-hours. Legitimate remote workers typically use VPN with
+      internal IPs. Direct external auth during off-hours warrants review.
+    enabled: true
+    mitre_tactics:
+      - TA0001  # Initial Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.anomalies.is_after_hours: true
+        - enrich.classification.src_ip_type: public
+    response:
+      - Verify with user via out-of-band communication
+      - Check if VPN or authorized remote access tool
+      - Review session activity for suspicious behavior
+      - Consider requiring step-up authentication
+
+  # ============================================================================
+  # Category 2: Threat Intelligence
+  #
+  # Enrichment-only detections: IP reputation and Tor exit node data
+  # from L2 databases are not available in Wazuh natively. These rules
+  # apply uniformly to ALL sources, unlike Wazuh IOC rules (99903-99920)
+  # which only cover specific event types.
+  # ============================================================================
+
+  - id: TI-001
+    name: Malicious IP Communication
+    type: single
+    category: threat_intelligence
+    severity: critical
+    description: >
+      Communication with an IP address flagged as malicious by threat
+      intelligence feeds. Applies to all sources uniformly — any event
+      with a malicious source or destination IP triggers this rule.
+    enabled: true
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      OR:
+        - enrich.network_intel.src_reputation.ip_reputation: malicious
+        - enrich.network_intel.dest_reputation.ip_reputation: malicious
+    response:
+      - Block source IP at firewall immediately
+      - Isolate affected host from network
+      - Investigate all recent connections from/to this IP
+      - Check affected systems for malware or backdoors
+
+  - id: TI-002
+    name: Tor Exit Node Communication
+    type: single
+    category: threat_intelligence
+    severity: high
+    description: >
+      Outbound traffic to or from a known Tor exit node. Tor usage can
+      indicate data exfiltration, C2 communication, or policy violation.
+      Only flags external outbound to reduce noise from inbound Tor scans.
+    enabled: true
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      AND:
+        - OR:
+            - enrich.network_intel.src_tor.is_exit_node: true
+            - enrich.network_intel.dest_tor.is_exit_node: true
+        - enrich.classification.is_external_outbound: true
+    response:
+      - Verify if authorized privacy tool or VPN usage
+      - Review user activity and accessed resources
+      - Check for data exfiltration attempts
+      - Consider blocking Tor traffic per organizational policy
+
+  - id: TI-003
+    name: Suspicious IP with Allowed Traffic
+    type: single
+    category: threat_intelligence
+    severity: high
+    description: >
+      Traffic from an IP with suspicious (not yet malicious) reputation
+      that was not blocked by perimeter defenses. These IPs are on
+      watchlists but haven't been confirmed malicious — allowed traffic
+      from them warrants investigation.
+    enabled: true
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      AND:
+        - enrich.network_intel.src_reputation.ip_reputation: suspicious
+        - enrich.normalization.action:
+            not_in: ["denied", "blocked"]
+    response:
+      - Review traffic content and destination
+      - Check if source IP has been recently upgraded to malicious
+      - Monitor for follow-up activity from same source
+      - Consider adding to block list if activity is anomalous
+
+  # ============================================================================
+  # Category 3: Reconnaissance
+  #
+  # Catches: SSH scanning (5701/5706/5731), web scanning (31151-31154),
+  #   generic firewall drops (4151), IDS alerts (20151/20152),
+  #   any source flagged by enricher behavioral counters
+  # ============================================================================
+
+  - id: RECON-001
+    name: Port Scan from External Source
+    type: single
+    category: reconnaissance
+    severity: high
+    description: >
+      External IP scanning multiple ports on internal systems. The enricher
+      flags port scans when unique destination ports exceed threshold.
+      Requires public source IP to avoid flagging internal service discovery.
+    enabled: true
+    mitre_tactics:
+      - TA0043  # Reconnaissance
+    conditions:
+      AND:
+        - enrich.anomalies.is_port_scan: true
+        - enrich.classification.src_ip_type: public
+    response:
+      - Block source IP at perimeter firewall
+      - Check if authorized penetration test
+      - Review firewall logs for exploitation attempts following scan
+      - Alert security team for analysis
+
+  - id: RECON-002
+    name: Network Sweep Detected
+    type: single
+    category: reconnaissance
+    severity: high
+    description: >
+      Source IP contacting 30+ unique destinations within 1 hour with high
+      event frequency. Indicates host enumeration or network mapping.
+      Behavioral counters from the enricher detect sweeps across sources.
+    enabled: true
+    mitre_tactics:
+      - TA0043  # Reconnaissance
+    conditions:
+      AND:
+        - enrich.classification.src_ip_type: public
+        - enrich.behavioral.unique_destinations_1h:
+            gte: 30
+        - enrich.counters.src_ip_5m:
+            gte: 50
+    response:
+      - Identify scanning tool or technique being used
+      - Block at network perimeter
+      - Check targeted systems for successful exploitation
+      - Review IDS/IPS logs for attack signatures
+
+  - id: RECON-003
+    name: Internal Reconnaissance
+    type: single
+    category: reconnaissance
+    severity: medium
+    description: >
+      Internal host scanning multiple destinations or performing port scans.
+      Early indicator of a compromised host performing network discovery.
+      Only fires for private source IPs to distinguish from external scans
+      (caught by RECON-001/002).
+    enabled: true
+    mitre_tactics:
+      - TA0007  # Discovery
+    conditions:
+      AND:
+        - enrich.classification.src_ip_type: private
+        - OR:
+            - enrich.anomalies.is_port_scan: true
+            - enrich.behavioral.unique_destinations_1h:
+                gte: 15
+    response:
+      - Investigate source host for compromise indicators
+      - Check for unauthorized tools or malware
+      - Review recent authentication events on source host
+      - Consider isolating host pending investigation
+
+  # ============================================================================
+  # Category 4: Lateral Movement
+  #
+  # Catches: Sysmon PsExec/WinRM/RDP (92650/92652/92656),
+  #   pass-the-hash (92602), internal auth chains, worm/ransomware spread
+  # ============================================================================
+
+  - id: LATERAL-001
+    name: Internal Lateral Movement
+    type: single
+    category: lateral_movement
+    severity: critical
+    description: >
+      Lateral movement detected between internal hosts during after-hours.
+      The enricher flags lateral movement when a source contacts many
+      internal destinations. After-hours condition reduces FPs from
+      legitimate admin tools during business hours.
+    enabled: true
+    mitre_tactics:
+      - TA0008  # Lateral Movement
+    conditions:
+      AND:
+        - enrich.anomalies.is_lateral_movement: true
+        - enrich.classification.is_internal_traffic: true
+        - enrich.anomalies.is_after_hours: true
+    response:
+      - Isolate source host immediately
+      - Check for malware, backdoors, or unauthorized tools
+      - Review authentication logs for stolen credentials
+      - Investigate recent security events on source host
+      - Check all destination hosts for compromise
+
+  - id: LATERAL-002
+    name: Rapid Internal Host Hopping
+    type: aggregation
+    category: lateral_movement
+    severity: critical
+    description: >
+      Single internal source accessing 15+ internal systems within 1 hour.
+      Detects ransomware spread, worm activity, or active breach.
+      Aggregation-based: groups events by source IP and counts.
+    enabled: true
+    time_window: 3600  # 1 hour
+    mitre_tactics:
+      - TA0008  # Lateral Movement
+    group_by:
+      - subject.ip
+    conditions:
+      enrich.classification.is_internal_traffic: true
+    threshold:
+      count:
+        gte: 15
+        unique_field: object.ip
+    response:
+      - Isolate source host immediately — assume active breach
+      - Check for ransomware or worm activity
+      - Review all accessed systems for compromise indicators
+      - Begin incident response procedure
+
+  # ============================================================================
+  # Category 5: Data Exfiltration
+  #
+  # All exfiltration rules require traffic to have actually succeeded.
+  # Blocked/denied traffic cannot exfiltrate data — the firewall did its job.
+  # This prevents false positives from FortiGate app-ctrl blocks
+  # (e.g., Windows Update connections to settings-win.data.microsoft.com).
+  # ============================================================================
+
+  - id: EXFIL-001
+    name: High-Volume Outbound Transfer
+    type: single
+    category: data_exfiltration
+    severity: high
+    description: >
+      Large volume of allowed outbound traffic crossing national borders.
+      The action filter (not denied/blocked) prevents FPs from routine
+      firewall blocks. Cross-border requirement adds geographic context.
+    enabled: true
+    mitre_tactics:
+      - TA0010  # Exfiltration
+    conditions:
+      AND:
+        - enrich.classification.is_external_outbound: true
+        - enrich.normalization.action:
+            not_in: ["denied", "blocked"]
+        - enrich.counters.src_ip_5m:
+            gte: 100
+        - enrich.anomalies.cross_border: true
+    response:
+      - Identify data being transferred and destination
+      - Check DLP alerts for sensitive data classification
+      - Verify user authorization for data access
+      - Review recent file access logs on source host
+      - Consider blocking transfer if unauthorized
+
+  - id: EXFIL-002
+    name: After-Hours Data Exfiltration
+    type: single
+    category: data_exfiltration
+    severity: high
+    description: >
+      Allowed outbound cross-border transfer outside business hours.
+      Lower volume threshold than EXFIL-001 because after-hours
+      exfiltration is higher risk even at lower volumes.
+    enabled: true
+    mitre_tactics:
+      - TA0010  # Exfiltration
+    conditions:
+      AND:
+        - enrich.classification.is_external_outbound: true
+        - enrich.normalization.action:
+            not_in: ["denied", "blocked"]
+        - enrich.anomalies.is_after_hours: true
+        - enrich.counters.src_ip_5m:
+            gte: 50
+        - enrich.anomalies.cross_border: true
+    response:
+      - Alert on-call security team immediately
+      - Identify source user and accessed data
+      - Check for unauthorized access to sensitive files
+      - Consider blocking egress temporarily
+      - Investigate for insider threat or compromise
+
+  # ============================================================================
+  # Category 6: Account Compromise
+  #
+  # Enrichment-only detections: impossible travel and cross-continent
+  # login analysis computed in L2. These apply across all auth sources
+  # (SSH, Windows, VPN, AWS, O365) — not available in Wazuh natively.
+  # ============================================================================
+
+  - id: TRAVEL-001
+    name: Impossible Geographic Travel
+    type: single
+    category: account_compromise
+    severity: critical
+    description: >
+      User authenticated from geographically impossible locations (would
+      require travel speed > 1000 km/h). Computed by L2 enricher using
+      historical login location tracking. Strong account compromise signal.
+    enabled: true
+    mitre_tactics:
+      - TA0001  # Initial Access
+      - TA0006  # Credential Access
+    conditions:
+      enrich.anomalies.is_impossible_travel: true
+    response:
+      - Assume account compromise — lock account immediately
+      - Force logout of all active sessions
+      - Require password reset and MFA enrollment
+      - Review all activity since first suspicious login
+      - Check for privilege escalation or data access
+
+  - id: TRAVEL-002
+    name: Cross-Continent Authentication
+    type: single
+    category: account_compromise
+    severity: high
+    description: >
+      Successful authentication from location 5000+ km away, crossing
+      continents. Less definitive than impossible travel but still
+      suspicious. Only fires on allowed (successful) auth events.
+    enabled: true
+    mitre_tactics:
+      - TA0001  # Initial Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.geo.cross_continent: true
+        - enrich.geo.distance_km:
+            gte: 5000
+    response:
+      - Verify with user via out-of-band communication
+      - Check for VPN or proxy usage
+      - Review session activity for suspicious behavior
+      - Consider requiring step-up authentication
+
+  # ============================================================================
+  # Category 7: Defense Evasion
+  #
+  # Catches: Windows event log cleared (593 level 9),
+  #   audit log cleared (18118 level 9), CloudTrail disruption (99030),
+  #   any log tampering detected by Wazuh
+  # ============================================================================
+
+  - id: EVASION-001
+    name: Log/Audit Tampering
+    type: single
+    category: defense_evasion
+    severity: critical
+    description: >
+      Security logs or audit trails cleared or tampered with. Attackers
+      clear logs to cover tracks after compromise. Matches Wazuh rule
+      groups: logs_cleared (60117, 18118, 593), log_clearing (63104,
+      MS log clear), log_clearing_auditlog (audit log clear). The
+      correlation engine groups this with other alerts from the same
+      source IP, providing context (was this preceded by brute force?).
+    enabled: true
+    mitre_tactics:
+      - TA0005  # Defense Evasion
+    conditions:
+      # security.tags is a list from Wazuh rule.groups; the contains
+      # operator matches substrings in str(list), catching:
+      #   logs_cleared, log_clearing, log_clearing_auditlog
+      OR:
+        - security.tags:
+            contains: "logs_cleared"
+        - security.tags:
+            contains: "log_clearing"
+    response:
+      - Investigate source host for compromise immediately
+      - Preserve any remaining logs before further tampering
+      - Check for recent failed/successful auth attempts from same IP
+      - Review system integrity — check for rootkits or backdoors
+      - Activate incident response if combined with other alerts
+
+  # ============================================================================
+  # Category 8: Composite Risk
+  #
+  # Safety net for high-severity events not caught by specific rules above.
+  # Catches: malware (62113, 87105, 91700), exploitation (91000-91007,
+  #   40102-40107), credential dump (92024, 92900), defense evasion
+  #   (92008-92015), APT (99606, 99607), ransomware (99594),
+  #   multi-stage (99611), compromised accounts (99612),
+  #   supply chain (GitHub 91115-91130), process injection,
+  #   WMI/registry persistence, and more.
+  # ============================================================================
+
+  - id: RISK-001
+    name: Critical Risk Score Event
+    type: single
+    category: high_risk
+    severity: critical
+    description: >
+      Event with risk_score >= 80 AND 3+ anomaly flags. The risk score
+      is computed by L2 from Wazuh alert level, enrichment data, and
+      behavioral counters. High-level Wazuh events (level 12+) with
+      multiple anomalies indicate active threats: malware detection,
+      active exploitation, credential dumping, defense evasion,
+      APT activity, ransomware, or process injection.
+    enabled: true
+    mitre_tactics:
+      - TA0001  # Initial Access (generic — actual tactic varies)
+    conditions:
+      AND:
+        - enrich.risk_score:
+            gte: 80
+        - enrich.anomalies.anomaly_count:
+            gte: 3
+    response:
+      - Review all contributing risk factors in enrichment data
+      - Correlate with other security events from same source
+      - Escalate to senior security analyst
+      - Consider immediate containment measures
+
+  - id: RISK-002
+    name: Sustained High-Risk Activity
+    type: aggregation
+    category: high_risk
+    severity: high
+    description: >
+      5+ allowed events with risk_score >= 60 from the same source IP
+      within 15 minutes. Excludes blocked/denied traffic to avoid FPs
+      from routine firewall blocks (e.g., Windows Update app-ctrl).
+      Catches sustained attack campaigns, persistent misconfigurations,
+      or ongoing compromise activity.
+    enabled: true
+    time_window: 900  # 15 minutes
+    mitre_tactics:
+      - TA0001  # Initial Access
+    group_by:
+      - subject.ip
+    conditions:
+      AND:
+        - enrich.risk_score:
+            gte: 60
+        - enrich.normalization.action:
+            not_in: ["denied", "blocked"]
+    threshold:
+      count:
+        gte: 5
+    response:
+      - Assume active attack or compromise in progress
+      - Block source IP if external
+      - Isolate host if internal
+      - Begin incident response procedure
+
+  - id: RISK-003
+    name: Multi-Anomaly Medium Risk
+    type: single
+    category: high_risk
+    severity: medium
+    description: >
+      Event with risk_score >= 50 AND 2+ anomaly flags. Below the
+      RISK-001 threshold (80/3) but still concerning — widens the safety
+      net to catch events with moderate risk and multiple anomalies that
+      individually fall below critical thresholds.
+    enabled: true
+    mitre_tactics:
+      - TA0001  # Initial Access (generic — actual tactic varies)
+    conditions:
+      AND:
+        - enrich.risk_score:
+            gte: 50
+        - enrich.anomalies.anomaly_count:
+            gte: 2
+    response:
+      - Review contributing risk factors and anomaly flags
+      - Correlate with other events from same source IP
+      - Escalate if additional context confirms threat
+      - Monitor for escalation to higher risk levels
+
+# Rule metadata
+metadata:
+  version: "2.0"
+  last_updated: "2026-02-16"
+  total_rules: 21
+  rule_categories:
+    - authentication
+    - threat_intelligence
+    - reconnaissance
+    - lateral_movement
+    - data_exfiltration
+    - account_compromise
+    - defense_evasion
+    - high_risk
+  rules_removed_from_v1:
+    - TI-003: "Country alone is insufficient signal — Chinese user on VPN is not an attack"
+    - SCAN-003: "Redundant with RECON-001 and RECON-002"
+    - EXFIL-003: "Cloud provider IPs serve CDN/updates/SaaS — caused Windows Update FP"
+    - PROTO-001: "Non-standard ports too common in practice"
+    - HOURS-001: "After-hours login alone is not an attack pattern"
+    - POLICY-001: "Any international website visit triggers this — not actionable for SOC"
